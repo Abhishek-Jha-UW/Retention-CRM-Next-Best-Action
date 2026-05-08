@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 
@@ -7,8 +8,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import churn_pipeline as cp
 import model as mdl
-from narrative import synthesize_memo
+from narrative import explain_model_performance, synthesize_memo
 
 
 st.set_page_config(
@@ -19,13 +21,30 @@ st.set_page_config(
 )
 
 
-@st.cache_data(show_spinner="Calibrating synthetic workspace…")
-def load_workspace(database_seed: int, horizon_months: int, n_accounts: int) -> tuple[pd.DataFrame, mdl.ModelBundle]:
-    rng_train = database_seed + 11
-    raw = mdl.generate_synthetic_crm_data(n_customers=n_accounts, seed=database_seed, renewal_horizon_months=horizon_months)
-    bundle = mdl.train_churn_model(raw, seed=rng_train % 5000)
-    scored = mdl.score_accounts(raw, bundle)
-    return scored, bundle
+def _init_session() -> None:
+    defaults = {
+        "raw_df": None,
+        "trained": None,
+        "scored_df": None,
+        "sim_df": None,
+        "churn_trained": False,
+        "model_explain_cache": None,
+        "last_sim_a": None,
+        "last_sim_b": None,
+        "last_spec_names": None,
+        "memo_context": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def _openai_api_key() -> str:
+    try:
+        val = st.secrets["OPENAI_API_KEY"]
+    except Exception:  # noqa: BLE001
+        return ""
+    return val if isinstance(val, str) else str(val)
 
 
 def intervention_presets(which: str) -> mdl.InterventionSpec:
@@ -97,301 +116,474 @@ def distribution_figure(results_a: dict, results_b: dict, label_a: str, label_b:
     return fig
 
 
-def calibration_figure(bundle: mdl.ModelBundle) -> go.Figure | None:
-    cal = bundle.metrics.get("calibration") if bundle.metrics else None
-    if not cal:
-        return None
+def confusion_figure(cm: dict) -> go.Figure:
+    # Rows: actual 0, 1 — cols: predicted 0, 1
+    z = [[cm["tn"], cm["fp"]], [cm["fn"], cm["tp"]]]
+    text = [[f"TN<br>{cm['tn']}", f"FP<br>{cm['fp']}"], [f"FN<br>{cm['fn']}", f"TP<br>{cm['tp']}"]]
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=["Predicted 0", "Predicted 1"],
+            y=["Actual 0", "Actual 1"],
+            colorscale="Blues",
+            text=text,
+            texttemplate="%{text}",
+            showscale=False,
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=320,
+        margin=dict(l=40, r=20, t=40, b=40),
+        title=f"Confusion @ threshold {cm.get('threshold', 0.5):.2f}",
+    )
+    return fig
+
+
+def roc_figure(curve: dict, auc: float) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=cal["prob_pred"],
-            y=cal["prob_true"],
-            mode="lines+markers",
-            name="Reliability",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=[0, 1],
-            y=[0, 1],
-            mode="lines",
-            name="Perfect calibration",
-            line=dict(dash="dash", color="#b0b0b0"),
-        )
-    )
+    if curve.get("fpr"):
+        fig.add_trace(go.Scatter(x=curve["fpr"], y=curve["tpr"], mode="lines", name="ROC"))
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Chance", line=dict(dash="dash", color="#999")))
+    auc_txt = f"{auc:.3f}" if isinstance(auc, (int, float)) and math.isfinite(auc) else "n/a"
     fig.update_layout(
         template="plotly_white",
-        height=360,
-        xaxis_title="Mean predicted risk (bin)",
-        yaxis_title="Observed churn rate",
-        margin=dict(l=20, r=20, t=30, b=30),
+        height=340,
+        margin=dict(l=20, r=20, t=40, b=40),
+        title=f"ROC curve (holdout AUC = {auc_txt})",
+        xaxis_title="False positive rate",
+        yaxis_title="True positive rate",
     )
     return fig
 
 
-def coefficient_figure(bundle: mdl.ModelBundle) -> go.Figure | None:
-    coefs = bundle.metrics.get("logistic_coef_scaled") if bundle.metrics else None
-    if not coefs:
+def coef_or_importance_figure(trained: cp.TrainedChurnModel) -> go.Figure | None:
+    m = trained.metrics
+    if trained.model_kind == "logistic" and m.get("coefficients"):
+        items = sorted(m["coefficients"].items(), key=lambda kv: abs(kv[1]), reverse=True)
+        labels = [k for k, _ in items]
+        values = [v for _, v in items]
+        title = "Logistic coefficients (transformed feature space)"
+    elif trained.model_kind == "xgboost" and m.get("feature_importance"):
+        items = sorted(m["feature_importance"].items(), key=lambda kv: abs(kv[1]), reverse=True)
+        labels = [k for k, _ in items]
+        values = [v for _, v in items]
+        title = "XGBoost feature importance (gain-based)"
+    else:
         return None
-    items = sorted(coefs.items(), key=lambda kv: abs(kv[1]), reverse=True)
-    labels = [k for k, _ in items]
-    values = [v for _, v in items]
     fig = go.Figure(go.Bar(x=values, y=labels, orientation="h", marker_color="#4c78a8"))
-    fig.update_layout(
-        template="plotly_white",
-        height=360,
-        margin=dict(l=20, r=20, t=30, b=30),
-        xaxis_title="Coefficient (standardized features)",
-        yaxis_title="",
-    )
+    fig.update_layout(template="plotly_white", height=360, margin=dict(l=20, r=20, t=40, b=30), title=title)
     return fig
 
 
-def _openai_api_key() -> str:
-    try:
-        val = st.secrets["OPENAI_API_KEY"]
-    except Exception:  # noqa: BLE001
-        return ""
-    return val if isinstance(val, str) else str(val)
+def _is_builtin_sample_schema(df: pd.DataFrame) -> bool:
+    return all(c in df.columns for c in mdl.FEATURE_COLUMNS) and "churn_within_horizon" in df.columns
 
 
 def main() -> None:
+    _init_session()
     st.title("Retention Decision Lab")
-    st.caption("Simulate **net margin** outcomes under uncertain interventions — not only churn probability.")
+    st.caption("Train churn on **your** rows, then simulate how interventions move **net margin** under uncertainty.")
+
+    api_key = _openai_api_key().strip()
 
     with st.sidebar:
-        st.header("Inputs")
-        database_seed = st.number_input("Synthetic data seed", min_value=0, max_value=99_999, value=42, step=1)
-        n_accounts = st.slider("Accounts in universe", min_value=1500, max_value=8000, value=4000, step=250)
-        horizon_months = st.slider("Renewal horizon (months)", min_value=2, max_value=6, value=3)
+        st.header("Session")
+        if st.button("Reset workspace", type="secondary"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            _init_session()
+            st.rerun()
+        st.divider()
+        st.markdown("**Scenario Monte Carlo**")
         sim_runs = st.slider("Monte Carlo draws", min_value=150, max_value=900, value=360, step=30)
+        top_n = st.slider("Priority accounts to touch", min_value=50, max_value=1200, value=450, step=25)
         st.divider()
-        st.markdown("**Cohort selection**")
-        top_n = st.slider("Priority accounts to touch", min_value=150, max_value=1200, value=450, step=50)
-        segment_filter = st.multiselect(
-            "Segment filter (optional)",
-            options=["SMB", "Mid-market", "Strategic"],
-            default=["SMB", "Mid-market", "Strategic"],
-        )
-        st.divider()
-        st.markdown(
-            "Tier A lift is **sensitivity**, not a causal guarantee. "
-            "Tighten ranges with experiments when you have them."
-        )
+        st.caption("Tier A lift = sensitivity bands, not proven causal lift without experiments.")
 
-    scored, bundle = load_workspace(int(database_seed), int(horizon_months), int(n_accounts))
+    st.markdown("### Step 1 — Load data and train a churn model")
+    st.markdown(
+        "Upload a labeled table (historical churn / renewal outcome as 0/1), pick features, "
+        "then review discrimination (ROC-AUC), calibration-at-threshold (confusion matrix), and drivers."
+    )
+
+    dc1, dc2, dc3 = st.columns(3)
+    with dc1:
+        st.download_button(
+            label="Download CSV template",
+            data=cp.build_template_csv(),
+            file_name="churn_training_template.csv",
+            mime="text/csv",
+        )
+    with dc2:
+        if st.button("Load sample CRM data", type="primary"):
+            st.session_state["raw_df"] = mdl.generate_synthetic_crm_data(n_customers=3500, seed=42, renewal_horizon_months=3)
+            st.session_state["churn_trained"] = False
+            st.session_state["trained"] = None
+            st.session_state["scored_df"] = None
+            st.session_state["sim_df"] = None
+            st.success("Sample loaded — scroll to map columns and train.")
+            st.rerun()
+
+    with dc3:
+        up = st.file_uploader("Upload CSV", type=["csv"], help="UTF-8 CSV with a binary churn column.")
+        if up is not None:
+            try:
+                st.session_state["raw_df"] = pd.read_csv(up)
+                st.session_state["churn_trained"] = False
+                st.session_state["trained"] = None
+                st.session_state["scored_df"] = None
+                st.session_state["sim_df"] = None
+                st.success(f"Loaded {len(st.session_state['raw_df']):,} rows.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not parse CSV: {exc}")
+
+    paste = st.text_area("Or paste CSV here (include header row)", height=140, placeholder="account_id,churn,...")
+    if st.button("Parse pasted CSV"):
+        if not paste.strip():
+            st.warning("Paste CSV text first.")
+        else:
+            try:
+                st.session_state["raw_df"] = pd.read_csv(io.StringIO(paste))
+                st.session_state["churn_trained"] = False
+                st.session_state["trained"] = None
+                st.session_state["scored_df"] = None
+                st.session_state["sim_df"] = None
+                st.success(f"Parsed {len(st.session_state['raw_df']):,} rows.")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Parse error: {exc}")
+
+    raw_df: pd.DataFrame | None = st.session_state.get("raw_df")
+    if raw_df is None:
+        st.info("Load sample data, upload a file, or paste CSV to continue.")
+        return
+
+    st.caption(f"Current table: **{len(raw_df):,}** rows × **{raw_df.shape[1]}** columns.")
+
+    with st.expander("Preview data", expanded=False):
+        st.dataframe(raw_df.head(20), use_container_width=True)
+
+    st.subheader("Column mapping")
+    cols_list = raw_df.columns.tolist()
+    id_exclude = st.multiselect("ID / leakage columns to exclude from features", options=cols_list, default=[c for c in cols_list if c.lower() in {"account_id", "id", "customer_id"}])
+    target_col = st.selectbox("Churn label column (0 = retained, 1 = churned)", options=cols_list, index=cols_list.index("churn_within_horizon") if "churn_within_horizon" in cols_list else 0)
+
+    suggested = cp.suggest_numeric_feature_columns(raw_df, target_col, id_exclude)
+    if _is_builtin_sample_schema(raw_df):
+        default_feats = [c for c in mdl.FEATURE_COLUMNS if c in suggested]
+    else:
+        default_feats = suggested[: min(12, len(suggested))]
+    if not default_feats:
+        default_feats = suggested[: min(8, len(suggested))]
+    feature_cols = st.multiselect("Feature columns (numeric)", options=suggested, default=default_feats or suggested[:8])
+    if len(feature_cols) < 2:
+        st.warning("Pick at least two numeric feature columns.")
+
+    model_choice_ui = st.selectbox(
+        "Model",
+        options=["Automatic", "Logistic regression", "XGBoost"],
+        index=0,
+        help="Automatic compares holdout ROC-AUC between logistic and XGBoost when xgboost is installed.",
+    )
+    test_size = st.slider("Holdout fraction", min_value=0.15, max_value=0.4, value=0.25, step=0.05)
+    train_seed = st.number_input("Train / split seed", min_value=0, max_value=99_999, value=42, step=1)
+
+    train_btn = st.button("Train churn model", type="primary", disabled=len(feature_cols) < 2)
+    if train_btn:
+        try:
+            choice_map = {"Automatic": "automatic", "Logistic regression": "logistic", "XGBoost": "xgboost"}
+            trained = cp.train_churn_classifier(
+                raw_df,
+                feature_columns=feature_cols,
+                target_column=target_col,
+                model_choice=choice_map[model_choice_ui],
+                test_size=float(test_size),
+                seed=int(train_seed),
+            )
+            scored = cp.score_full_dataframe(raw_df, trained)
+            st.session_state["trained"] = trained
+            st.session_state["scored_df"] = scored
+            st.session_state["churn_trained"] = True
+            st.session_state["sim_df"] = None
+            st.session_state["model_explain_cache"] = None
+            st.session_state["last_sim_a"] = None
+            st.session_state["last_sim_b"] = None
+            st.session_state["memo_context"] = None
+            st.success("Model trained — review metrics below, then continue to scenarios.")
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Training failed: {exc}")
+
+    trained = st.session_state.get("trained")
+    if not st.session_state.get("churn_trained") or trained is None:
+        return
+
+    st.divider()
+    m = trained.metrics
+    auc = m["roc_auc_holdout"]
+    auc_label = f"{auc:.3f}" if isinstance(auc, (int, float)) and math.isfinite(auc) else "n/a"
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Model", trained.model_kind.title())
+    m2.metric("Holdout ROC-AUC", auc_label)
+    m3.metric("Train rows", f"{m['n_train']:,}")
+    m4.metric("Test churn rate", f"{m['test_churn_rate']:.1%}")
+
+    if note := m.get("auto_selection_note"):
+        st.info(note)
+
+    cleft, cright = st.columns(2)
+    with cleft:
+        st.plotly_chart(confusion_figure(m["confusion_matrix"]), use_container_width=True)
+    with cright:
+        st.plotly_chart(roc_figure(m["roc_curve"], m["roc_auc_holdout"]), use_container_width=True)
+
+    fig_drv = coef_or_importance_figure(trained)
+    if fig_drv:
+        st.plotly_chart(fig_drv, use_container_width=True)
+
+    st.markdown("#### AI: interpret model performance")
+    if not api_key:
+        st.warning("Add `OPENAI_API_KEY` in Streamlit secrets to enable explanations.")
+    else:
+        explain_ctx = {
+            "model_kind": trained.model_kind,
+            "feature_columns": list(trained.feature_columns),
+            "target_column": trained.target_column,
+            "roc_auc_holdout": m.get("roc_auc_holdout"),
+            "n_train": m.get("n_train"),
+            "n_test": m.get("n_test"),
+            "test_churn_rate": m.get("test_churn_rate"),
+            "confusion_matrix": m.get("confusion_matrix"),
+        }
+        if st.button("Explain metrics with AI", key="explain_model_ai"):
+            with st.spinner("Summarizing…"):
+                try:
+                    st.session_state["model_explain_cache"] = explain_model_performance(explain_ctx, api_key=api_key)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(str(exc))
+        cache = st.session_state.get("model_explain_cache")
+        if cache:
+            st.markdown(f"**{cache.get('summary', '')}**")
+            if cache.get("strengths"):
+                st.markdown("**Strengths**")
+                for b in cache["strengths"]:
+                    st.markdown(f"- {b}")
+            if cache.get("watchouts"):
+                st.markdown("**Watchouts**")
+                for b in cache["watchouts"]:
+                    st.markdown(f"- {b}")
+            if cache.get("next_steps"):
+                st.markdown("**Next steps**")
+                for b in cache["next_steps"]:
+                    st.markdown(f"- {b}")
+
+    st.markdown("---")
+    st.markdown("### Step 2 — Map economics, then run revenue & scenario simulations")
+    st.success(
+        "Churn scores are ready. **Next:** tie each row to **dollar exposure** (margin or revenue at risk) "
+        "so we can rank accounts and stress-test interventions."
+    )
+
+    scored_df: pd.DataFrame = st.session_state["scored_df"]
+    exclude_econ = {"p_churn_horizon", target_col}
+    num_choices = [
+        c
+        for c in scored_df.columns
+        if pd.api.types.is_numeric_dtype(scored_df[c]) and c not in exclude_econ
+    ]
+    if not num_choices:
+        st.error("No numeric columns left for economics mapping — check your data.")
+        return
+
+    default_margin = "margin_at_risk_horizon" if "margin_at_risk_horizon" in scored_df.columns else num_choices[0]
+    default_mrr = "mrr_monthly" if "mrr_monthly" in scored_df.columns else None
+    default_seg = "segment" if "segment" in scored_df.columns else None
+
+    em1, em2, em3 = st.columns(3)
+    margin_col = em1.selectbox(
+        "Value column ($ at risk if churn)",
+        options=num_choices,
+        index=num_choices.index(default_margin) if default_margin in num_choices else 0,
+        help="Either total margin dollars already rolled to the horizon, or pick monthly and check the box below.",
+    )
+    margin_is_monthly = em2.checkbox("Column is monthly margin (multiply by horizon)", value=False)
+    horizon_econ = int(em3.number_input("Horizon (months) for monthly → total", min_value=1, max_value=36, value=3, step=1))
+    mrr_opts = ["(derive from margin / horizon)"] + [c for c in num_choices if c != margin_col]
+    default_mrr_idx = 0
+    if default_mrr and default_mrr in mrr_opts:
+        default_mrr_idx = mrr_opts.index(default_mrr)
+    mrr_col = st.selectbox(
+        "MRR column (for discount costing; optional)",
+        options=mrr_opts,
+        index=default_mrr_idx,
+    )
+    seg_col = st.selectbox("Segment column (optional)", options=["(none — single segment)"] + cols_list, index=0)
+    mrr_pick = None if mrr_col.startswith("(") else mrr_col
+    seg_pick = None if seg_col.startswith("(") else seg_col
+
+    if st.button("Apply economics & unlock scenarios", type="primary"):
+        try:
+            sim_df = mdl.attach_simulation_economics(
+                scored_df,
+                margin_column=margin_col,
+                margin_is_monthly=margin_is_monthly,
+                horizon_months=horizon_econ,
+                mrr_column=mrr_pick,
+                segment_column=seg_pick,
+            )
+            st.session_state["sim_df"] = sim_df
+            st.session_state["horizon_econ"] = horizon_econ
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(str(exc))
+
+    sim_df: pd.DataFrame | None = st.session_state.get("sim_df")
+    if sim_df is None:
+        st.info("Click **Apply economics & unlock scenarios** to continue.")
+        return
+
+    st.markdown(
+        "#### What happens here\n"
+        "We rank accounts by **expected margin loss** = churn probability × dollars at risk, "
+        "then Monte Carlo sample uncertain **lift** and **uptake** bands for two interventions. "
+        "Distributions show upside *and* tail risk (e.g., costly discounts with weak uptake)."
+    )
+
+    seg_opts = sorted(sim_df["segment"].astype(str).unique().tolist())
+    segment_filter = st.multiselect("Segment filter for touched cohort", options=seg_opts, default=seg_opts)
 
     segments = tuple(segment_filter) if segment_filter else None
-    cohort = mdl.prioritize_cohort(scored, top_n=top_n, segment_filter=segments)
+    cohort = mdl.prioritize_cohort(sim_df, top_n=top_n, segment_filter=segments)
     if cohort.empty:
-        cohort = scored.nlargest(top_n, "expected_margin_loss_horizon").copy()
+        cohort = sim_df.nlargest(top_n, "expected_margin_loss_horizon").copy()
 
     baseline_loss = float((cohort["p_churn_horizon"] * cohort["margin_at_risk_horizon"]).sum())
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Scored accounts", f"{len(sim_df):,}")
+    s2.metric("Cohort size", f"{len(cohort):,}")
+    s3.metric("Cohort expected margin loss", mdl.format_currency(baseline_loss))
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Accounts scored", f"{len(scored):,}")
-    roc = bundle.metrics["roc_auc"]
-    roc_label = f"{roc:.3f}" if isinstance(roc, (int, float)) and math.isfinite(roc) else "n/a"
-    k2.metric("Holdout ROC-AUC", roc_label)
-    k3.metric("Empirical churn rate", f"{scored['churn_within_horizon'].mean():.1%}")
-    k4.metric("Selected cohort expected loss", mdl.format_currency(baseline_loss))
+    st.subheader("Cohort snapshot")
+    show_cols = [c for c in ["segment", "p_churn_horizon", "margin_at_risk_horizon", "expected_margin_loss_horizon"] if c in cohort.columns]
+    snap = cohort[show_cols].head(15).copy()
+    if "p_churn_horizon" in snap.columns:
+        snap["p_churn_horizon"] = snap["p_churn_horizon"].map(lambda v: f"{v:.1%}")
+    for col in ("margin_at_risk_horizon", "expected_margin_loss_horizon"):
+        if col in snap.columns:
+            snap[col] = snap[col].map(mdl.format_currency)
+    st.dataframe(snap, use_container_width=True, hide_index=True)
 
-    tab_overview, tab_sim, tab_model, tab_memo = st.tabs(["Overview", "Decision simulator", "Model card", "Strategic memo"])
+    st.subheader("Scenario Monte Carlo")
+    c1, c2 = st.columns(2)
+    preset_a = c1.selectbox(
+        "Scenario A",
+        [
+            "Renewal concession (priced in)",
+            "High-touch save play",
+            "Enablement burst (cheap, weak lift)",
+        ],
+        index=0,
+        key="pa",
+    )
+    preset_b = c2.selectbox(
+        "Scenario B",
+        ["High-touch save play", "Renewal concession (priced in)", "Enablement burst (cheap, weak lift)"],
+        index=0,
+        key="pb",
+    )
+    spec_a = intervention_presets(preset_a)
+    spec_b = intervention_presets(preset_b)
 
-    with tab_overview:
-        st.markdown(
-            """
-**What this demonstrates:** a behavioral risk model, transparent intervention assumptions, and Monte Carlo uncertainty.
-You compare two plays on the *same at-risk cohort* and read off upside *and* tail risk.
-            """.strip()
-        )
-        st.divider()
-        left, right = st.columns((1.1, 0.9))
-        with left:
-            st.subheader("Top of queue (sample)")
-            display_cols = [
-                "segment",
-                "p_churn_horizon",
-                "margin_at_risk_horizon",
-                "expected_margin_loss_horizon",
-                "login_events_30d",
-                "support_tickets_90d",
-                "nps_score",
-            ]
-            sample = cohort[display_cols].head(12).copy()
-            sample["p_churn_horizon_fmt"] = sample["p_churn_horizon"].map(lambda v: f"{v:.1%}")
-            sample["margin_at_risk_fmt"] = sample["margin_at_risk_horizon"].map(mdl.format_currency)
-            sample["expected_loss_fmt"] = sample["expected_margin_loss_horizon"].map(mdl.format_currency)
-            show_cols = [
-                "segment",
-                "p_churn_horizon_fmt",
-                "margin_at_risk_fmt",
-                "expected_loss_fmt",
-                "login_events_30d",
-                "support_tickets_90d",
-                "nps_score",
-            ]
-            st.dataframe(sample[show_cols].rename(columns={"p_churn_horizon_fmt": "p_churn", "margin_at_risk_fmt": "margin@risk", "expected_loss_fmt": "exp_loss"}), use_container_width=True, height=360)
-        with right:
-            st.subheader("Expected loss footprint")
-            fig_loss = go.Figure(
-                go.Histogram(x=scored["expected_margin_loss_horizon"], nbinsx=45, marker_color="#72b7b2")
-            )
-            fig_loss.update_layout(
-                template="plotly_white", height=360, xaxis_title="Expected margin loss", yaxis_title="Accounts"
-            )
-            st.plotly_chart(fig_loss, use_container_width=True)
+    with st.expander("Tune Scenario A assumptions", expanded=False):
+        a1, a2, a3 = st.columns(3)
+        spec_a.uplift_pp_low = float(a1.number_input("A lift low (pp)", value=float(spec_a.uplift_pp_low), step=0.005, format="%.3f", key="a1"))
+        spec_a.uplift_pp_high = float(a2.number_input("A lift high (pp)", value=float(spec_a.uplift_pp_high), step=0.005, format="%.3f", key="a2"))
+        spec_a.uptake_low = float(a3.number_input("A uptake low", value=float(spec_a.uptake_low), step=0.02, format="%.2f", key="a3"))
+        spec_a.uptake_high = float(a1.number_input("A uptake high", value=float(spec_a.uptake_high), step=0.02, format="%.2f", key="a4"))
+        spec_a.fixed_cost_per_touched_account = float(a2.number_input("A fixed $ / account", value=float(spec_a.fixed_cost_per_touched_account), step=5.0, key="a5"))
+        spec_a.discount_rate_on_mrr = float(a3.number_input("A discount on MRR", value=float(spec_a.discount_rate_on_mrr), step=0.01, format="%.2f", key="a6"))
+        spec_a.discount_horizon_months = int(a1.number_input("A discount months", value=int(spec_a.discount_horizon_months), min_value=0, max_value=36, step=1, key="a7"))
 
-    with tab_sim:
-        st.subheader("Configure competing interventions")
-        c1, c2 = st.columns(2)
-        preset_a = c1.selectbox(
-            "Scenario A preset",
-            [
-                "Renewal concession (priced in)",
-                "High-touch save play",
-                "Enablement burst (cheap, weak lift)",
-            ],
-            index=0,
-        )
-        preset_b = c2.selectbox(
-            "Scenario B preset",
-            ["High-touch save play", "Renewal concession (priced in)", "Enablement burst (cheap, weak lift)"],
-            index=0,
-        )
+    with st.expander("Tune Scenario B assumptions", expanded=False):
+        b1, b2, b3 = st.columns(3)
+        spec_b.uplift_pp_low = float(b1.number_input("B lift low (pp)", value=float(spec_b.uplift_pp_low), step=0.005, format="%.3f", key="b1"))
+        spec_b.uplift_pp_high = float(b2.number_input("B lift high (pp)", value=float(spec_b.uplift_pp_high), step=0.005, format="%.3f", key="b2"))
+        spec_b.uptake_low = float(b3.number_input("B uptake low", value=float(spec_b.uptake_low), step=0.02, format="%.2f", key="b3"))
+        spec_b.uptake_high = float(b1.number_input("B uptake high", value=float(spec_b.uptake_high), step=0.02, format="%.2f", key="b4"))
+        spec_b.fixed_cost_per_touched_account = float(b2.number_input("B fixed $ / account", value=float(spec_b.fixed_cost_per_touched_account), step=5.0, key="b5"))
+        spec_b.discount_rate_on_mrr = float(b3.number_input("B discount on MRR", value=float(spec_b.discount_rate_on_mrr), step=0.01, format="%.2f", key="b6"))
+        spec_b.discount_horizon_months = int(b1.number_input("B discount months", value=int(spec_b.discount_horizon_months), min_value=0, max_value=36, step=1, key="b7"))
 
-        spec_a = intervention_presets(preset_a)
-        spec_b = intervention_presets(preset_b)
+    run_seed = int(train_seed) if train_seed else 42
+    if st.button("Run Monte Carlo comparison", type="primary", key="run_mc"):
+        with st.spinner("Simulating…"):
+            res_a = mdl.simulate_intervention_distribution(cohort, spec_a, n_simulations=sim_runs, seed=run_seed + 3)
+            res_b = mdl.simulate_intervention_distribution(cohort, spec_b, n_simulations=sim_runs, seed=run_seed + 5)
+            st.session_state["last_sim_a"] = res_a
+            st.session_state["last_sim_b"] = res_b
+            st.session_state["last_spec_names"] = (spec_a.name, spec_b.name)
 
-        with st.expander("Fine-tune Scenario A", expanded=False):
-            sa1, sa2, sa3 = st.columns(3)
-            spec_a.uplift_pp_low = float(sa1.number_input("Lift low (pp)", value=float(spec_a.uplift_pp_low), step=0.005, format="%.3f"))
-            spec_a.uplift_pp_high = float(sa2.number_input("Lift high (pp)", value=float(spec_a.uplift_pp_high), step=0.005, format="%.3f"))
-            spec_a.uptake_low = float(sa3.number_input("Uptake low", value=float(spec_a.uptake_low), step=0.02, format="%.2f"))
-            spec_a.uptake_high = float(sa1.number_input("Uptake high", value=float(spec_a.uptake_high), step=0.02, format="%.2f"))
-            spec_a.fixed_cost_per_touched_account = float(sa2.number_input("Fixed $ per touched account", value=float(spec_a.fixed_cost_per_touched_account), step=5.0))
-            spec_a.discount_rate_on_mrr = float(sa3.number_input("Discount rate on MRR", value=float(spec_a.discount_rate_on_mrr), step=0.01, format="%.2f"))
-            spec_a.discount_horizon_months = int(sa1.number_input("Discount horizon (months)", value=int(spec_a.discount_horizon_months), min_value=0, max_value=36, step=1))
+    res_a_state = st.session_state.get("last_sim_a")
+    res_b_state = st.session_state.get("last_sim_b")
+    if res_a_state and res_b_state:
+        names = st.session_state.get("last_spec_names", (spec_a.name, spec_b.name))
+        sum_a = mdl.summarize_draws(res_a_state["net_benefit"], names[0])
+        sum_b = mdl.summarize_draws(res_b_state["net_benefit"], names[1])
+        qa, qb = st.columns(2)
+        qa.markdown(f"##### {names[0]}")
+        qb.markdown(f"##### {names[1]}")
+        qa.metric("Median net", mdl.format_currency(sum_a["median"]))
+        qa.metric("5th–95th", f"{mdl.format_currency(sum_a['p05'])} → {mdl.format_currency(sum_a['p95'])}")
+        qa.metric("P(net loss)", f"{sum_a['prob_negative']:.0%}")
+        qb.metric("Median net", mdl.format_currency(sum_b["median"]))
+        qb.metric("5th–95th", f"{mdl.format_currency(sum_b['p05'])} → {mdl.format_currency(sum_b['p95'])}")
+        qb.metric("P(net loss)", f"{sum_b['prob_negative']:.0%}")
+        st.plotly_chart(distribution_figure(res_a_state, res_b_state, names[0], names[1]), use_container_width=True)
 
-        with st.expander("Fine-tune Scenario B", expanded=False):
-            sb1, sb2, sb3 = st.columns(3)
-            spec_b.uplift_pp_low = float(sb1.number_input("B lift low (pp)", value=float(spec_b.uplift_pp_low), step=0.005, format="%.3f"))
-            spec_b.uplift_pp_high = float(sb2.number_input("B lift high (pp)", value=float(spec_b.uplift_pp_high), step=0.005, format="%.3f"))
-            spec_b.uptake_low = float(sb3.number_input("B uptake low", value=float(spec_b.uptake_low), step=0.02, format="%.2f"))
-            spec_b.uptake_high = float(sb1.number_input("B uptake high", value=float(spec_b.uptake_high), step=0.02, format="%.2f"))
-            spec_b.fixed_cost_per_touched_account = float(sb2.number_input("B fixed $ per touched account", value=float(spec_b.fixed_cost_per_touched_account), step=5.0))
-            spec_b.discount_rate_on_mrr = float(sb3.number_input("B discount rate on MRR", value=float(spec_b.discount_rate_on_mrr), step=0.01, format="%.2f"))
-            spec_b.discount_horizon_months = int(sb1.number_input("B discount horizon (months)", value=int(spec_b.discount_horizon_months), min_value=0, max_value=36, step=1))
+        memo_ctx = {
+            "cohort_accounts": int(cohort.shape[0]),
+            "baseline_expected_margin_loss": round(baseline_loss, 2),
+            "monte_carlo_runs": int(sim_runs),
+            "scenario_a": {"name": names[0], "summary": {k: round(v, 4) for k, v in sum_a.items() if k != "label"}},
+            "scenario_b": {"name": names[1], "summary": {k: round(v, 4) for k, v in sum_b.items() if k != "label"}},
+        }
+        st.session_state["memo_context"] = memo_ctx
 
-        run = st.button("Run Monte Carlo comparison", type="primary", use_container_width=True)
-        if run:
-            with st.spinner("Running draws…"):
-                res_a = mdl.simulate_intervention_distribution(cohort, spec_a, n_simulations=sim_runs, seed=int(database_seed) + 3)
-                res_b = mdl.simulate_intervention_distribution(cohort, spec_b, n_simulations=sim_runs, seed=int(database_seed) + 5)
-                st.session_state["last_sim_a"] = res_a
-                st.session_state["last_sim_b"] = res_b
-                st.session_state["last_spec_names"] = (spec_a.name, spec_b.name)
-
-        res_a_state = st.session_state.get("last_sim_a")
-        res_b_state = st.session_state.get("last_sim_b")
-        if res_a_state and res_b_state:
-            names = st.session_state.get("last_spec_names", (spec_a.name, spec_b.name))
-            sum_a = mdl.summarize_draws(res_a_state["net_benefit"], names[0])
-            sum_b = mdl.summarize_draws(res_b_state["net_benefit"], names[1])
-
-            qa, qb = st.columns(2)
-            qa.markdown(f"##### {names[0]} — net vs do nothing")
-            qb.markdown(f"##### {names[1]} — net vs do nothing")
-            m1a, m2a, m3a = qa.columns(3)
-            m1b, m2b, m3b = qb.columns(3)
-            m1a.metric("Median", mdl.format_currency(sum_a["median"]))
-            m2a.metric("5th–95th", f"{mdl.format_currency(sum_a['p05'])}→{mdl.format_currency(sum_a['p95'])}")
-            m3a.metric("P(net loss)", f"{sum_a['prob_negative']:.0%}")
-
-            m1b.metric("Median", mdl.format_currency(sum_b["median"]))
-            m2b.metric("5th–95th", f"{mdl.format_currency(sum_b['p05'])}→{mdl.format_currency(sum_b['p95'])}")
-            m3b.metric("P(net loss)", f"{sum_b['prob_negative']:.0%}")
-
-            st.plotly_chart(distribution_figure(res_a_state, res_b_state, names[0], names[1]), use_container_width=True)
-            st.caption("Tail risk frequently comes from discount economics or tepid uptake — not only scoring noise.")
-
-            st.session_state["memo_context"] = {
-                "cohort_accounts": int(cohort.shape[0]),
-                "baseline_expected_margin_loss": round(baseline_loss, 2),
-                "monte_carlo_runs": int(sim_runs),
-                "scenario_a": {
-                    "name": names[0],
-                    "summary": {key: round(value, 4) for key, value in sum_a.items() if key != "label"},
-                },
-                "scenario_b": {
-                    "name": names[1],
-                    "summary": {key: round(value, 4) for key, value in sum_b.items() if key != "label"},
-                },
-            }
+        st.markdown("#### AI: interpret scenario outputs")
+        if api_key:
+            model_name = st.text_input("OpenAI model", value="gpt-4o-mini", key="openai_model_scen")
+            if st.button("Explain scenario results with AI", key="explain_scen"):
+                with st.spinner("Drafting…"):
+                    try:
+                        scen_obj = synthesize_memo(memo_ctx, api_key=api_key, model=model_name.strip())
+                        st.subheader(scen_obj.get("headline", "Scenario readout"))
+                        for bullet in scen_obj.get("bullets", []):
+                            st.markdown(f"- {bullet}")
+                        st.markdown("**Recommendation:** " + str(scen_obj.get("recommend", "neutral")))
+                        for r in scen_obj.get("risks", []):
+                            st.markdown(f"- {r}")
+                        if scen_obj.get("confidence_note"):
+                            st.caption(scen_obj["confidence_note"])
+                        with st.expander("Metrics JSON sent to the model"):
+                            st.code(json.dumps(memo_ctx, indent=2))
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(str(exc))
         else:
-            st.info("Run the Monte Carlo sweep to populate charts plus memo inputs.")
+            st.caption("Add OpenAI key in secrets to narrate scenarios.")
 
-    with tab_model:
-        st.subheader("Transparent churn baseline")
-        roc = bundle.metrics["roc_auc"]
-        roc_label = f"{roc:.3f}" if isinstance(roc, (int, float)) and math.isfinite(roc) else "n/a"
-        st.write(f"Training size {bundle.metrics['n_train']:,} · Held-out ROC-AUC {roc_label}")
-
-        cmid, cright = st.columns(2)
-        cal_fig = calibration_figure(bundle)
-        coef_fig = coefficient_figure(bundle)
-        if cal_fig:
-            cmid.plotly_chart(cal_fig, use_container_width=True)
-        if coef_fig:
-            cright.plotly_chart(coef_fig, use_container_width=True)
-
-        coef_df = pd.DataFrame([{"feature": k, "coefficient_scaled": v} for k, v in bundle.metrics["logistic_coef_scaled"].items()])
-        with st.expander("Coefficient table"):
-            st.dataframe(coef_df, use_container_width=True, hide_index=True)
-
-        st.markdown(
-            """
-**Sandbox caveats**
-
-- Synthetic generator ⇒ metrics sanity-check fidelity, not market truth  
-- Associations only unless you bolt on uplift evaluation with experiments  
-- Margin roll-ups compress rich contract nuances into horizon dollars
-            """.strip()
-        )
-
-    with tab_memo:
-        st.markdown("Optional GPT narration uses **frozen JSON facts** emitted by Python — no invented quantiles.")
-
-        api_key = _openai_api_key().strip()
-        if not api_key:
-            st.warning("Add `OPENAI_API_KEY` through Streamlit secrets or `.streamlit/secrets.toml` (never commit it).")
-
-        memo_ctx = st.session_state.get("memo_context")
-        model_name = st.text_input("OpenAI model", value="gpt-4o-mini")
-        memo_btn = st.button("Generate memo", disabled=not memo_ctx or not api_key)
-
-        if memo_btn and memo_ctx and api_key:
-            with st.spinner("Drafting structured memo…"):
-                try:
-                    memo_obj = synthesize_memo(metrics_context=memo_ctx, api_key=api_key, model=model_name.strip())
-                    st.subheader(memo_obj.get("headline", "Decision memo"))
-                    for bullet in memo_obj.get("bullets", []):
-                        st.markdown(f"- {bullet}")
-                    st.markdown("**Recommendation:** " + str(memo_obj.get("recommend", "neutral")).replace("_", " "))
-                    risks = memo_obj.get("risks", [])
-                    if risks:
-                        st.markdown("**Risks or caveats**")
-                        for item in risks:
-                            st.markdown(f"- {item}")
-                    if memo_obj.get("confidence_note"):
-                        st.caption(memo_obj["confidence_note"])
-                    with st.expander("Authoritative metrics JSON"):
-                        st.code(json.dumps(memo_ctx, indent=2))
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Memo generation failed: {exc}")
-
-        elif not memo_ctx:
-            st.info("Run the simulator tab first so quantiles exist to narrate.")
+        st.markdown("#### Structured decision memo (JSON)")
+        if api_key:
+            if st.button("Generate structured memo", key="memo_struct"):
+                with st.spinner("Formatting memo…"):
+                    try:
+                        memo_model = str(st.session_state.get("openai_model_scen", "gpt-4o-mini")).strip() or "gpt-4o-mini"
+                        memo_obj = synthesize_memo(memo_ctx, api_key=api_key, model=memo_model)
+                        st.json(memo_obj)
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(str(exc))
+    else:
+        st.info("Run Monte Carlo to populate charts and AI scenario explanations.")
 
 
 if __name__ == "__main__":

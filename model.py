@@ -278,3 +278,52 @@ def format_currency(x: float) -> str:
     abs_x = abs(x)
     return f"-${abs_x:,.0f}" if x < 0 else f"${abs_x:,.0f}"
 
+
+def attach_simulation_economics(
+    df: pd.DataFrame,
+    *,
+    margin_column: str,
+    margin_is_monthly: bool,
+    horizon_months: int,
+    mrr_column: str | None,
+    segment_column: str | None,
+) -> pd.DataFrame:
+    """
+    Normalize user-uploaded columns into the names expected by prioritize_cohort
+    and simulate_intervention_distribution.
+    """
+    if "p_churn_horizon" not in df.columns:
+        raise ValueError("Expected column p_churn_horizon from churn scoring step.")
+    if margin_column not in df.columns:
+        raise ValueError(f"Margin column '{margin_column}' not found.")
+
+    out = df.copy()
+    margin_src = pd.to_numeric(out[margin_column], errors="coerce").fillna(0.0).astype(float)
+    if margin_is_monthly:
+        out["margin_at_risk_horizon"] = margin_src * float(max(horizon_months, 1))
+    else:
+        out["margin_at_risk_horizon"] = margin_src
+
+    if mrr_column and mrr_column in out.columns:
+        out["mrr_monthly"] = pd.to_numeric(out[mrr_column], errors="coerce").fillna(0.0).astype(float).clip(lower=1.0)
+    else:
+        out["mrr_monthly"] = (out["margin_at_risk_horizon"] / float(max(horizon_months, 1))).clip(lower=1.0)
+
+    if segment_column and segment_column in out.columns:
+        out["segment"] = out[segment_column].astype(str)
+    else:
+        out["segment"] = "All"
+
+    out["renewal_horizon_months"] = int(horizon_months)
+    out["expected_margin_loss_horizon"] = out["p_churn_horizon"].astype(float) * out["margin_at_risk_horizon"].astype(float)
+    try:
+        out["risk_tier"] = pd.qcut(
+            out["expected_margin_loss_horizon"],
+            q=4,
+            labels=["Low", "Medium", "Elevated", "Critical"],
+            duplicates="drop",
+        )
+    except ValueError:
+        out["risk_tier"] = "Unbucketed"
+    return out
+

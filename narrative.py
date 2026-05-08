@@ -46,3 +46,34 @@ def synthesize_memo(metrics_context: dict[str, Any], api_key: str, model: str = 
 
     txt = rsp.choices[0].message.content or "{}"
     return json.loads(txt)
+
+
+MODEL_EXPLAIN_SCHEMA = (
+    '{"summary":"<2-3 sentences>","strengths":["<string>","<string>"],'
+    '"watchouts":["<string>","<string>"],"next_steps":["<string>","<string>"]}'
+)
+
+
+def explain_model_performance(metrics_context: dict[str, Any], api_key: str, model: str = "gpt-4o-mini") -> dict[str, Any]:
+    """Interpret holdout metrics + confusion matrix; must not invent numbers beyond CONTEXT."""
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed.")
+
+    client = OpenAI(api_key=api_key)
+    payload = json.dumps(metrics_context, indent=2)
+    system = (
+        "You are a senior data scientist reviewing a churn classifier for a business audience. "
+        "Use ONLY facts present in CONTEXT JSON (ROC-AUC, confusion counts, sample sizes, class balance, model type). "
+        "Explain what ROC-AUC and confusion matrix imply in plain language. "
+        "Do not claim causal lift, deployment readiness, or regulatory compliance unless CONTEXT states it. "
+        f"Return JSON shaped like: {MODEL_EXPLAIN_SCHEMA}."
+    )
+    user = f"CONTEXT:\n```json\n{payload}\n```\nReturn JSON only."
+    rsp = client.chat.completions.create(
+        model=model,
+        temperature=0.25,
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+    )
+    txt = rsp.choices[0].message.content or "{}"
+    return json.loads(txt)
