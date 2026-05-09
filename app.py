@@ -36,7 +36,6 @@ def _init_session() -> None:
         "last_sim_b": None,
         "last_spec_names": None,
         "memo_context": None,
-        "cm_threshold": 0.5,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -363,7 +362,14 @@ def main() -> None:
             st.session_state["last_sim_a"] = None
             st.session_state["last_sim_b"] = None
             st.session_state["memo_context"] = None
-            st.session_state["cm_threshold"] = 0.5
+            # Fresh threshold widget + holdout arrays (Streamlit-safe copies for interactive eval)
+            st.session_state["confusion_threshold_slider"] = 0.5
+            if getattr(trained, "y_holdout", None) is not None and getattr(trained, "proba_holdout", None) is not None:
+                st.session_state["holdout_y"] = np.asarray(trained.y_holdout, dtype=np.int64).copy()
+                st.session_state["holdout_p"] = np.asarray(trained.proba_holdout, dtype=np.float64).copy()
+            else:
+                st.session_state["holdout_y"] = None
+                st.session_state["holdout_p"] = None
             st.success("Model trained — review metrics below, then continue to scenarios.")
             st.rerun()
         except Exception as exc:  # noqa: BLE001
@@ -382,6 +388,10 @@ def main() -> None:
     m2.metric("Holdout ROC-AUC", auc_label)
     m3.metric("Train rows", f"{m['n_train']:,}")
     m4.metric("Test churn rate", f"{m['test_churn_rate']:.1%}")
+    st.caption(
+        "**Holdout ROC-AUC** does not depend on the classification threshold (it integrates all cutoffs). "
+        "Only the confusion matrix, precision/recall/F1, flagged rate, and the red ROC point update when you move the slider."
+    )
 
     if note := m.get("auto_selection_note"):
         st.info(note)
@@ -391,18 +401,24 @@ def main() -> None:
         "ROC-AUC summarizes all cutoffs; the confusion matrix is **one** cutoff. "
         "Move the slider to explore precision/recall tradeoffs (e.g. fewer false alarms vs. missed churners)."
     )
+    # Use a dedicated widget key (not shared with `value=`) so Streamlit reliably updates on drag.
+    if "confusion_threshold_slider" not in st.session_state:
+        st.session_state["confusion_threshold_slider"] = 0.5
     st.slider(
         "Classify as churn if P(churn) ≥",
         min_value=0.05,
         max_value=0.95,
-        value=float(st.session_state.get("cm_threshold", 0.5)),
+        value=0.5,
         step=0.01,
-        key="cm_threshold",
+        key="confusion_threshold_slider",
     )
-    thr = float(st.session_state["cm_threshold"])
+    thr = float(st.session_state["confusion_threshold_slider"])
 
-    y_h = getattr(trained, "y_holdout", None)
-    p_h = getattr(trained, "proba_holdout", None)
+    y_h = st.session_state.get("holdout_y")
+    p_h = st.session_state.get("holdout_p")
+    if y_h is None or p_h is None:
+        y_h = getattr(trained, "y_holdout", None)
+        p_h = getattr(trained, "proba_holdout", None)
     if y_h is not None and p_h is not None:
         cm_dyn = cp.confusion_matrix_at_threshold(y_h, p_h, thr)
         tmet = cp.threshold_classification_metrics(y_h, p_h, thr)
@@ -415,8 +431,9 @@ def main() -> None:
         cm_dyn = m["confusion_matrix"]
 
     cleft, cright = st.columns(2)
+    plot_thr_key = f"thr_{thr:.4f}"
     with cleft:
-        st.plotly_chart(confusion_figure(cm_dyn), use_container_width=True)
+        st.plotly_chart(confusion_figure(cm_dyn), use_container_width=True, key=f"cm_{plot_thr_key}")
     with cright:
         st.plotly_chart(
             roc_figure(
@@ -427,12 +444,13 @@ def main() -> None:
                 y_score=p_h,
             ),
             use_container_width=True,
+            key=f"roc_{plot_thr_key}",
         )
 
     if y_h is not None and p_h is not None:
         cal_fig = calibration_holdout_figure(y_h, p_h)
         if cal_fig:
-            st.plotly_chart(cal_fig, use_container_width=True)
+            st.plotly_chart(cal_fig, use_container_width=True, key=f"cal_{plot_thr_key}")
 
     fig_drv = coef_or_importance_figure(trained)
     if fig_drv:
@@ -442,15 +460,19 @@ def main() -> None:
     if not api_key:
         st.warning("Add `OPENAI_API_KEY` in Streamlit secrets to enable explanations.")
     else:
-        _yh = getattr(trained, "y_holdout", None)
-        _ph = getattr(trained, "proba_holdout", None)
+        _yh = st.session_state.get("holdout_y")
+        _ph = st.session_state.get("holdout_p")
+        if _yh is None or _ph is None:
+            _yh = getattr(trained, "y_holdout", None)
+            _ph = getattr(trained, "proba_holdout", None)
+        _thr_ai = float(st.session_state["confusion_threshold_slider"])
         cm_ai = (
-            cp.confusion_matrix_at_threshold(_yh, _ph, float(st.session_state["cm_threshold"]))
+            cp.confusion_matrix_at_threshold(_yh, _ph, _thr_ai)
             if _yh is not None and _ph is not None
             else m.get("confusion_matrix")
         )
         tmet_ai = (
-            cp.threshold_classification_metrics(_yh, _ph, float(st.session_state["cm_threshold"]))
+            cp.threshold_classification_metrics(_yh, _ph, _thr_ai)
             if _yh is not None and _ph is not None
             else {}
         )
@@ -462,7 +484,7 @@ def main() -> None:
             "n_train": m.get("n_train"),
             "n_test": m.get("n_test"),
             "test_churn_rate": m.get("test_churn_rate"),
-            "threshold_used": float(st.session_state["cm_threshold"]),
+            "threshold_used": _thr_ai,
             "confusion_matrix": cm_ai,
             "threshold_metrics": tmet_ai,
         }

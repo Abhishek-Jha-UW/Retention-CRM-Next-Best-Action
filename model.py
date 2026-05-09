@@ -93,13 +93,13 @@ def generate_synthetic_crm_data(
     logits += np.log(login_events_30d + 5.5) * -0.93
     logits += tenure_months * -0.028
     logits += np.log(active_seats_pct + 15.5) * -0.014
-    logits += support_tickets_90d * 0.12
-    logits += (np.asarray(nps_score, dtype=float) - 6.85) * -0.22
-    logits += has_enterprise_addon * -0.38
-    # Slightly lower label noise + stronger scale for demo: more stable holdout AUC while staying plausible.
-    logits += rng.normal(0, 0.30, size=n_customers)
+    logits += support_tickets_90d * 0.15
+    logits += (np.asarray(nps_score, dtype=float) - 6.85) * -0.26
+    logits += has_enterprise_addon * -0.42
+    # Demo-friendly DGP: moderate noise + stronger standardized signal → holdout AUC typically mid‑0.7s+ on this feature set.
+    logits += rng.normal(0, 0.22, size=n_customers)
 
-    logits = (logits - logits.mean()) / (logits.std() + 1e-6) * 1.12 - 2.02
+    logits = (logits - logits.mean()) / (logits.std() + 1e-6) * 1.28 - 1.92
 
     churn_probability = 1 / (1 + np.exp(-logits))
     churn_within_horizon = rng.binomial(1, churn_probability)
