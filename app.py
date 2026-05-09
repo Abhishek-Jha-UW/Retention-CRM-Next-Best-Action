@@ -4,8 +4,11 @@ import io
 import json
 import math
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import confusion_matrix
 import streamlit as st
 
 import churn_pipeline as cp
@@ -33,6 +36,7 @@ def _init_session() -> None:
         "last_sim_b": None,
         "last_spec_names": None,
         "memo_context": None,
+        "cm_threshold": 0.5,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -53,11 +57,11 @@ def intervention_presets(which: str) -> mdl.InterventionSpec:
             name="Renewal concession",
             uplift_pp_low=0.022,
             uplift_pp_high=0.052,
-            uptake_low=0.48,
-            uptake_high=0.72,
+            uptake_low=0.42,
+            uptake_high=0.62,
             fixed_cost_per_touched_account=12.5,
-            discount_rate_on_mrr=0.12,
-            discount_horizon_months=12,
+            discount_rate_on_mrr=0.08,
+            discount_horizon_months=6,
         )
     if which == "High-touch save play":
         return mdl.InterventionSpec(
@@ -104,6 +108,7 @@ def distribution_figure(results_a: dict, results_b: dict, label_a: str, label_b:
             histnorm="probability density",
         )
     )
+    fig.add_vline(x=0.0, line_dash="dash", line_color="#64748b", annotation_text="Do nothing", annotation_position="top")
     fig.update_layout(
         barmode="overlay",
         template="plotly_white",
@@ -140,10 +145,58 @@ def confusion_figure(cm: dict) -> go.Figure:
     return fig
 
 
-def roc_figure(curve: dict, auc: float) -> go.Figure:
+def calibration_holdout_figure(y_true: np.ndarray, y_score: np.ndarray) -> go.Figure | None:
+    if len(np.unique(y_true)) < 2:
+        return None
+    try:
+        prob_true, prob_pred = calibration_curve(y_true, y_score, n_bins=8, strategy="quantile")
+    except ValueError:
+        return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=prob_pred, y=prob_true, mode="lines+markers", name="Reliability"))
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Perfect", line=dict(dash="dash", color="#94a3b8")))
+    fig.update_layout(
+        template="plotly_white",
+        height=320,
+        title="Holdout calibration (quantile bins)",
+        xaxis_title="Mean predicted risk",
+        yaxis_title="Observed churn rate",
+        margin=dict(l=20, r=20, t=40, b=40),
+    )
+    return fig
+
+
+def roc_operating_point(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> tuple[float, float]:
+    y_pred = (y_score >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    denom_neg = fp + tn
+    denom_pos = tp + fn
+    fpr = float(fp / denom_neg) if denom_neg else 0.0
+    tpr = float(tp / denom_pos) if denom_pos else 0.0
+    return fpr, tpr
+
+
+def roc_figure(
+    curve: dict,
+    auc: float,
+    threshold: float | None = None,
+    y_true: np.ndarray | None = None,
+    y_score: np.ndarray | None = None,
+) -> go.Figure:
     fig = go.Figure()
     if curve.get("fpr"):
         fig.add_trace(go.Scatter(x=curve["fpr"], y=curve["tpr"], mode="lines", name="ROC"))
+    if threshold is not None and y_true is not None and y_score is not None and len(np.unique(y_true)) >= 2:
+        fpr_op, tpr_op = roc_operating_point(y_true, y_score, threshold)
+        fig.add_trace(
+            go.Scatter(
+                x=[fpr_op],
+                y=[tpr_op],
+                mode="markers",
+                marker=dict(size=12, color="#dc2626", symbol="circle"),
+                name=f"Holdout @ τ={threshold:.2f}",
+            )
+        )
     fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Chance", line=dict(dash="dash", color="#999")))
     auc_txt = f"{auc:.3f}" if isinstance(auc, (int, float)) and math.isfinite(auc) else "n/a"
     fig.update_layout(
@@ -310,6 +363,7 @@ def main() -> None:
             st.session_state["last_sim_a"] = None
             st.session_state["last_sim_b"] = None
             st.session_state["memo_context"] = None
+            st.session_state["cm_threshold"] = 0.5
             st.success("Model trained — review metrics below, then continue to scenarios.")
             st.rerun()
         except Exception as exc:  # noqa: BLE001
@@ -332,11 +386,53 @@ def main() -> None:
     if note := m.get("auto_selection_note"):
         st.info(note)
 
+    st.markdown("#### Operating threshold (confusion matrix)")
+    st.caption(
+        "ROC-AUC summarizes all cutoffs; the confusion matrix is **one** cutoff. "
+        "Move the slider to explore precision/recall tradeoffs (e.g. fewer false alarms vs. missed churners)."
+    )
+    st.slider(
+        "Classify as churn if P(churn) ≥",
+        min_value=0.05,
+        max_value=0.95,
+        value=float(st.session_state.get("cm_threshold", 0.5)),
+        step=0.01,
+        key="cm_threshold",
+    )
+    thr = float(st.session_state["cm_threshold"])
+
+    y_h = getattr(trained, "y_holdout", None)
+    p_h = getattr(trained, "proba_holdout", None)
+    if y_h is not None and p_h is not None:
+        cm_dyn = cp.confusion_matrix_at_threshold(y_h, p_h, thr)
+        tmet = cp.threshold_classification_metrics(y_h, p_h, thr)
+        kpr, krc, kf1, kfg = st.columns(4)
+        kpr.metric("Precision (churn=1)", f"{tmet['precision']:.3f}")
+        krc.metric("Recall (churn=1)", f"{tmet['recall']:.3f}")
+        kf1.metric("F1 (churn=1)", f"{tmet['f1']:.3f}")
+        kfg.metric("Flagged as high-risk", f"{tmet['flagged_rate']:.1%}")
+    else:
+        cm_dyn = m["confusion_matrix"]
+
     cleft, cright = st.columns(2)
     with cleft:
-        st.plotly_chart(confusion_figure(m["confusion_matrix"]), use_container_width=True)
+        st.plotly_chart(confusion_figure(cm_dyn), use_container_width=True)
     with cright:
-        st.plotly_chart(roc_figure(m["roc_curve"], m["roc_auc_holdout"]), use_container_width=True)
+        st.plotly_chart(
+            roc_figure(
+                m["roc_curve"],
+                m["roc_auc_holdout"],
+                threshold=thr,
+                y_true=y_h,
+                y_score=p_h,
+            ),
+            use_container_width=True,
+        )
+
+    if y_h is not None and p_h is not None:
+        cal_fig = calibration_holdout_figure(y_h, p_h)
+        if cal_fig:
+            st.plotly_chart(cal_fig, use_container_width=True)
 
     fig_drv = coef_or_importance_figure(trained)
     if fig_drv:
@@ -346,6 +442,18 @@ def main() -> None:
     if not api_key:
         st.warning("Add `OPENAI_API_KEY` in Streamlit secrets to enable explanations.")
     else:
+        _yh = getattr(trained, "y_holdout", None)
+        _ph = getattr(trained, "proba_holdout", None)
+        cm_ai = (
+            cp.confusion_matrix_at_threshold(_yh, _ph, float(st.session_state["cm_threshold"]))
+            if _yh is not None and _ph is not None
+            else m.get("confusion_matrix")
+        )
+        tmet_ai = (
+            cp.threshold_classification_metrics(_yh, _ph, float(st.session_state["cm_threshold"]))
+            if _yh is not None and _ph is not None
+            else {}
+        )
         explain_ctx = {
             "model_kind": trained.model_kind,
             "feature_columns": list(trained.feature_columns),
@@ -354,7 +462,9 @@ def main() -> None:
             "n_train": m.get("n_train"),
             "n_test": m.get("n_test"),
             "test_churn_rate": m.get("test_churn_rate"),
-            "confusion_matrix": m.get("confusion_matrix"),
+            "threshold_used": float(st.session_state["cm_threshold"]),
+            "confusion_matrix": cm_ai,
+            "threshold_metrics": tmet_ai,
         }
         if st.button("Explain metrics with AI", key="explain_model_ai"):
             with st.spinner("Summarizing…"):
@@ -540,6 +650,11 @@ def main() -> None:
         qb.metric("5th–95th", f"{mdl.format_currency(sum_b['p05'])} → {mdl.format_currency(sum_b['p95'])}")
         qb.metric("P(net loss)", f"{sum_b['prob_negative']:.0%}")
         st.plotly_chart(distribution_figure(res_a_state, res_b_state, names[0], names[1]), use_container_width=True)
+        st.caption(
+            "**Reading net impact:** the dashed line is **do nothing**. To the **right** means that Monte Carlo draw favored the "
+            "intervention; to the **left** means intervention costs (fixed touch + any MRR discount) outweighed modeled "
+            "churn-margin savings. Spread reflects **Tier A** uncertainty in lift and uptake, not re-sampled churn labels."
+        )
 
         memo_ctx = {
             "cohort_accounts": int(cohort.shape[0]),

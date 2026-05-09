@@ -13,7 +13,7 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
+from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -33,6 +33,8 @@ class TrainedChurnModel:
     feature_columns: tuple[str, ...]
     target_column: str
     metrics: dict[str, Any]
+    y_holdout: np.ndarray | None = None
+    proba_holdout: np.ndarray | None = None
 
 
 def suggest_numeric_feature_columns(df: pd.DataFrame, target_col: str, exclude: list[str]) -> list[str]:
@@ -83,10 +85,28 @@ def _roc_auc_safe(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(roc_auc_score(y_true, y_score))
 
 
-def _confusion_at_threshold(y_true: np.ndarray, y_score: np.ndarray, threshold: float = 0.5) -> dict[str, Any]:
+def confusion_matrix_at_threshold(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict[str, Any]:
     y_pred = (y_score >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     return {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp), "threshold": float(threshold)}
+
+
+def threshold_classification_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict[str, Any]:
+    """Precision / recall / F1 for churn=1 at a fixed score cutoff."""
+    y_pred = (y_score >= threshold).astype(int)
+    if len(np.unique(y_true)) < 2:
+        return {
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+            "flagged_rate": float(np.mean(y_pred)),
+        }
+    return {
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "flagged_rate": float(np.mean(y_pred)),
+    }
 
 
 def _roc_curve_dict(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, list[float]]:
@@ -114,7 +134,7 @@ def _fit_and_evaluate(
         "n_train": int(len(y_train)),
         "n_test": int(len(y_test)),
         "test_churn_rate": float(np.mean(y_test)),
-        "confusion_matrix": _confusion_at_threshold(y_test, proba_test, 0.5),
+        "confusion_matrix": confusion_matrix_at_threshold(y_test, proba_test, 0.5),
         "roc_curve": _roc_curve_dict(y_test, proba_test),
     }
     if model_kind == "logistic":
@@ -134,6 +154,8 @@ def _fit_and_evaluate(
         feature_columns=feature_columns,
         target_column=target_column,
         metrics=metrics,
+        y_holdout=np.asarray(y_test, dtype=int),
+        proba_holdout=np.asarray(proba_test, dtype=float),
     )
 
 
